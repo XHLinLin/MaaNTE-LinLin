@@ -12,3 +12,4 @@ scikit-learn
 soundcard
 mido
 websockets>=14.0,<17.0
+ultralytics
