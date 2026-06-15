@@ -1,0 +1,13 @@
+{
+    "PinkPawHeist_Scheme4": {
+        "recognition": {
+            "type": "DirectHit"
+        },
+        "action": {
+            "type": "Custom",
+            "param": {
+                "custom_action": "PinkPawHeistScheme4Action"
+            }
+        }
+    }
+}
