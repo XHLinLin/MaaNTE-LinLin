@@ -70,19 +70,12 @@ def compare_itmes_center_coordinates_to_charactors_center_coordinates(items_x, i
     return offset_x, offset_y
 
 
-def get_yolo_model(ah=None):
-    import time
+def get_yolo_model():
     names = getattr(yolo_model, "names", None)
     if names:
         logger.info(f"YOLO model loaded: {len(names)} classes, names={names}")
     else:
         logger.warning("YOLO model: names not available")
-    if ah is not None:
-        for i in range(3):
-            t0 = time.monotonic()
-            img = ah.ctx.tasker.controller.post_screencap().wait().get()
-            yolo_model(img, verbose=False)
-            logger.info(f"[bench frame {i}] screencap+infer {(time.monotonic() - t0) * 1000:.0f}ms")
     return yolo_model
 
 
@@ -151,7 +144,7 @@ def align_to_class(
 
 
 def walk_until_class_exit(
-    ah, class_name: str, key: str = "W", confirm_area: int = 20000, timeout_ms: int = 18000
+    ah, class_name: str, key: str = "W", confirm_area: int = 20000, maximum_area: int = 40000, timeout_ms: int = 18000
 ) -> None:
     """
     按住指定键前进，YOLO 检测到指定类的包围盒面积 >= confirm_area 时视为稳定识别，
@@ -159,8 +152,7 @@ def walk_until_class_exit(
     """
     import time
 
-    logger.info(f"walk_until_class_exit 开始：{class_name}")
-    CHECK_INTERVAL = 0.05
+    CHECK_INTERVAL = 0.1
     EXIT_DEBOUNCE = 0.5  # portal 消失需持续此秒数才确认
 
     ah.key_down(key)
@@ -183,7 +175,7 @@ def walk_until_class_exit(
                     area = max(area, (x2 - x1) * (y2 - y1))
 
         if not confirmed:
-            if area >= confirm_area:
+            if area >= confirm_area and area < maximum_area:
                 confirmed = True
                 logger.info(f"{class_name} 面积 {area:.0f} >= {confirm_area}，已确认，等待消失")
             else:
@@ -495,7 +487,7 @@ class PinkPawHeistScheme4Action(CustomAction):
                 ah.click_key("1")
                 ah.delay(200)
                
-            get_yolo_model(ah)  # 测试模型 + 性能基准
+            get_yolo_model()  # 测试模型
                 
             ah.key_down("W")
             ah.delay(4500)
@@ -687,18 +679,15 @@ class PinkPawHeistScheme4Action(CustomAction):
             ah.key_up("W")
             # 躲第二道激光
             ah.delay(300)
-            
-            walk_until_class_exit(ah, "portal")
-            
             ah.key_down("W")
             ah.delay(10000)
             ah.key_up("W")
-
+            ah.delay(100)
             walk_until_class_exit(ah, "portal")
 
             # ---------- 移动至G1激光层 ----------
             ah.key_down("W")
-            ah.delay(6500)
+            ah.delay(6300)
             # 开始躲激光
             ah.key_up("W")
             ah.delay(200)
@@ -846,6 +835,8 @@ class PinkPawHeistScheme4Action(CustomAction):
             ah.delay(1100)
             ah.key_up("D")
             ah.delay(100)
+            
+            align_to_class(ah, "display table")
 
             ah.key_down("W")
             ah.delay(1000)
@@ -911,6 +902,8 @@ class PinkPawHeistScheme4Action(CustomAction):
             ah.delay(3100)
             ah.key_up("D")
             ah.delay(100)
+            
+            align_to_class(ah, "display table")
 
             ah.key_down("W")
             ah.delay(500)
@@ -943,6 +936,8 @@ class PinkPawHeistScheme4Action(CustomAction):
             ah.delay(1400)
             ah.key_up("D")
             ah.delay(100)
+            
+            align_to_class(ah, "display table")
 
             ah.key_down("W")
             ah.delay(500)
