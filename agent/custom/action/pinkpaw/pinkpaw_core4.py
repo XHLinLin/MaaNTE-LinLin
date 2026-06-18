@@ -2,9 +2,10 @@ from maa.agent.agent_server import AgentServer
 from maa.custom_action import CustomAction
 from maa.context import Context
 from maa.define import Status
-from datetime import datetime
 from ultralytics import YOLO   #加载yolo模型
 from PIL import Image
+import time
+import math
 
 from custom.action.Common.logger import get_logger
 logger = get_logger("PinkPawHeist")
@@ -34,6 +35,8 @@ REWARD_OCR_DELAY_MS = 3000
 POST_REWARD_DELAY_MS = 7000
 
 yolo_model = YOLO("resource/base/model/yolo/yolo.pt")  #填写加载Yolo模型的地址
+
+_run_start_time: float | None = None
 
 
 
@@ -86,7 +89,7 @@ def align_to_class(
     key_right: str = "D",
     screen_center_x: int = 640,
     threshold: int = 50,
-    min_step_ms: int = 60,
+    min_step_ms: int = 30,
     max_step_ms: int = 400,
     timeout_ms: int = 8000,
 ) -> bool:
@@ -103,6 +106,7 @@ def align_to_class(
     FULL_OFFSET = 500.0
 
     deadline = time.monotonic() + timeout_ms / 1000.0
+    consecutive_aligned = 0
 
     while time.monotonic() < deadline:
         ah.raise_if_stopped()
@@ -119,6 +123,7 @@ def align_to_class(
 
         if not centers:
             logger.debug(f"{class_name} 未检测到，随机移动寻找")
+            consecutive_aligned = 0
             key = key_right if random.random() > 0.5 else key_left
             ah.key_down(key)
             ah.delay(WANDER_MS, check_reward=False)
@@ -130,9 +135,14 @@ def align_to_class(
         logger.debug(f"{class_name} 中心 x={cx:.0f}，偏移={offset:.0f}")
 
         if abs(offset) <= threshold:
-            logger.info(f"{class_name} 已对齐（偏移 {offset:.0f}px）")
-            return True
+            consecutive_aligned += 1
+            if consecutive_aligned >= 2:
+                logger.info(f"{class_name} 已对齐（偏移 {offset:.0f}px）")
+                return True
+            ah.delay(150, check_reward=False)  # 等角色停稳再确认
+            continue
 
+        consecutive_aligned = 0
         step_ms = int(max(min_step_ms, min(max_step_ms, abs(offset) / FULL_OFFSET * max_step_ms)))
         key = key_left if offset < 0 else key_right
         ah.key_down(key)
@@ -480,20 +490,25 @@ class PinkPawHeistScheme4Action(CustomAction):
     def run(
         self, context: Context, argv: CustomAction.RunArg
     ) -> CustomAction.RunResult:
+        global _run_start_time
+        _run_start_time = time.monotonic()
         ah = ActionHelper(context)
         try:
             current_ctrl = ah.ctx.tasker.controller
             for _ in range(3):
                 ah.click_key("1")
                 ah.delay(200)
-               
+
             get_yolo_model()  # 测试模型
                 
             ah.key_down("W")
-            ah.delay(4500)
+            ah.delay(5000)
             ah.key_down("D")
             ah.delay(3400)
             ah.key_up("D")
+            ah.key_up("W")
+            align_to_class(ah, "door")
+            ah.key_down("W")
             ah.delay(2000)
             ah.key_up("W")
             ah.click_key("F")
@@ -799,9 +814,20 @@ class PinkPawHeistScheme4Action(CustomAction):
             ah.key_up("W")
             ah.delay(100)
             ah.key_down("A")
-            ah.delay(6120)
+            ah.delay(1700)
             ah.key_up("A")
             ah.delay(100)
+            
+            ah.key_down("S")
+            ah.delay(1500)
+            ah.key_up("S")
+            ah.delay(100)
+            
+            ah.key_down("A")
+            ah.delay(4420)
+            ah.key_up("A")
+            ah.delay(100)
+            
             # 偷左边展柜藏品
             ah.key_down("S")
             ah.delay(1000)
@@ -1036,7 +1062,7 @@ class PinkPawHeistScheme4Action(CustomAction):
             ah.key_down("S")
             ah.delay(800)
             ah.key_up("S")
-            ah.delay(8500)
+            wait_until(400, cycle_s=18)
 
             ah.key_down("A")
             ah.delay(7500)
@@ -1374,3 +1400,23 @@ class PinkPawHeistScheme4Action(CustomAction):
         ah.delay(500, check_reward=False)
         ah.click(775, 473)
         ah.delay(10000, check_reward=False)
+
+
+def wait_until(target_s: float, cycle_s: float = 0) -> None:
+    """阻塞到距本局开始 target_s 秒后再返回。
+    若已超过 target_s 且指定了 cycle_s，则等到 target_s + N*cycle_s（N 为最小正整数使结果 > 当前时间）。
+    未指定 cycle_s 或无 _run_start_time 则立即返回。
+    """
+    if _run_start_time is None:
+        return
+    elapsed = time.monotonic() - _run_start_time
+    if elapsed < target_s:
+        actual = target_s
+    elif cycle_s > 0:
+        n = math.ceil((elapsed - target_s) / cycle_s)
+        actual = target_s + n * cycle_s
+    else:
+        return
+    remaining = (_run_start_time + actual) - time.monotonic()
+    if remaining > 0:
+        time.sleep(remaining)
