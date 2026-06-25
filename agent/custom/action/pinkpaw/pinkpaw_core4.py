@@ -38,6 +38,169 @@ yolo_model = YOLO("resource/base/model/yolo/yolo.pt")  #填写加载Yolo模型�
 
 _run_start_time: float | None = None
 
+# 命名计时器注册表：name -> 起点（time.monotonic() 时间戳）。
+# "default" 计时器不在表内时回退到本局开始时间 _run_start_time。
+_timers: dict[str, float] = {}
+
+
+def reset_timer(name: str = "default") -> None:
+    """在流程中任意位置重置（或新建）一个命名计时器，
+    后续 wait_until(..., timer=name) 以此刻为新起点（T+0）。"""
+    _timers[name] = time.monotonic()
+    logger.info(f"计时器[{name}] 已重置")
+
+
+def _timer_origin(name: str = "default") -> "float | None":
+    """取命名计时器的起点；'default' 在未显式重置时回退到本局开始时间。"""
+    if name in _timers:
+        return _timers[name]
+    if name == "default":
+        return _run_start_time
+    return None
+
+
+class SessionRecorder:
+    """记录每一局（session）的 wait 触发点与成功/失败结果，逐行追加到临时 JSONL 文件，
+    便于跨大量运行做时间窗口分析。
+
+    每条 session 记录包含：
+      - session_id / start_wall：本局开始的墙钟时间（ISO，本地时区）
+      - result：success / fail / incomplete / aborted
+      - waits：每次 wait_until 出发时的快照列表，字段：
+          timer        参照的命名计时器
+          target_s     传入的目标秒数
+          cycle_s      周期（0 表示无周期）
+          actual_s     实际命中的目标秒数（含周期补偐）
+          fire_elapsed 出发时距该计时器起点的秒数
+          fire_wall    出发那一刻的墙钟时间（ISO，本地时区）——做窗口分析的关键
+    """
+
+    _file_path: "str | None" = None
+    _current: "dict | None" = None
+
+    @classmethod
+    def _path(cls) -> str:
+        if cls._file_path is None:
+            import os
+
+            # 项目根目录下的 temp/ 调试文件夹（由本文件位置上溯 4 级定位根目录），
+            # 不依赖运行时工作目录；temp/ 已加入 .gitignore，不进版本库。
+            root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+            debug_dir = os.path.join(root, "temp")
+            os.makedirs(debug_dir, exist_ok=True)
+            cls._file_path = os.path.join(debug_dir, "pinkpaw_time_windows.jsonl")
+            logger.info(f"时间窗口记录文件：{cls._file_path}")
+        return cls._file_path
+
+    @classmethod
+    def start(cls) -> None:
+        from datetime import datetime
+
+        # 上一局若未正常结束（早退等），先按 incomplete 落盘
+        if cls._current is not None:
+            cls.finish("incomplete")
+        now = datetime.now()
+        cls._current = {
+            "session_id": now.strftime("%Y%m%d_%H%M%S_%f"),
+            "start_wall": now.isoformat(timespec="milliseconds"),
+            "result": None,
+            "waits": [],
+        }
+
+    @classmethod
+    def record_wait(cls, timer: str, target_s: float, cycle_s: float,
+                    actual_s: float, fire_elapsed: float) -> None:
+        if cls._current is None:
+            return
+        from datetime import datetime
+
+        cls._current["waits"].append({
+            "timer": timer,
+            "target_s": round(target_s, 2),
+            "cycle_s": round(cycle_s, 2),
+            "actual_s": round(actual_s, 2),
+            "fire_elapsed": round(fire_elapsed, 2),
+            "fire_wall": datetime.now().isoformat(timespec="milliseconds"),
+        })
+
+    @classmethod
+    def finish(cls, result) -> None:
+        """result: True/False（成功/失败）或字符串（incomplete/aborted）。幂等：只落盘一次。"""
+        if cls._current is None:
+            return
+        if isinstance(result, bool):
+            cls._current["result"] = "success" if result else "fail"
+        else:
+            cls._current["result"] = str(result)
+        cls._flush(cls._current)
+        cls._current = None
+
+    @classmethod
+    def _flush(cls, record: dict) -> None:
+        import json
+
+        try:
+            with open(cls._path(), "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            logger.warning(f"时间窗口记录写入失败：{exc}")
+
+
+def record_and_notify(ah, success: bool) -> None:
+    """推送收益的同时记录本局结果到时间窗口文件。"""
+    notify_pinkpaw_reward(ah.ctx, success=success)
+    SessionRecorder.finish(success)
+
+
+class TimeDebugger:
+    """后台守护线程，每隔 interval_s 秒输出一次距起点的时间（T+xxx.xs），不阻塞主流程。
+    start_time 为 None 时用本局开始时间 _run_start_time；否则用传入的起点（time.monotonic() 时间戳）。
+    label 用于区分多个并行计时器的输出。
+    用法：
+        dbg = TimeDebugger(label="全局")
+        dbg.start()
+        ...
+        dbg.stop()
+    """
+
+    def __init__(self, interval_s: float = 5.0, label: str = "", start_time: "float | None" = None,
+                 timer: "str | None" = None):
+        import threading
+
+        self.interval_s = interval_s
+        self.label = label
+        self.start_time = start_time
+        self.timer = timer  # 指定后按命名计时器取起点（随 reset_timer 变化）
+        self._stop_event = threading.Event()
+        self._thread: "threading.Thread | None" = None
+
+    def _loop(self):
+        while not self._stop_event.wait(self.interval_s):
+            if self.start_time is not None:
+                base = self.start_time
+            elif self.timer is not None:
+                base = _timer_origin(self.timer)
+            else:
+                base = _run_start_time
+            if base is not None:
+                tag = f"[{self.label}] " if self.label else ""
+                logger.info(f"{tag}[T+{time.monotonic() - base:6.1f}s] debug tick")
+
+    def start(self):
+        import threading
+
+        if self._thread is not None:
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+
 
 
 class StopActionException(Exception):
@@ -92,9 +255,12 @@ def align_to_class(
     min_step_ms: int = 30,
     max_step_ms: int = 400,
     timeout_ms: int = 8000,
+    offset_px: int = 0,
 ) -> bool:
     """
-    横向移动直到指定类的中心落在屏幕水平中心 threshold 像素范围内。
+    横向移动直到指定类的中心落在目标点 threshold 像素范围内。
+    offset_px 为偏移补偿：目标点 = screen_center_x + offset_px
+    （负值让目标最终停在屏幕中心偏左，正值偏右）。
     步长按偏移量比例缩放（偏得近走得少），防止过冲。
     未检测到时随机 A/D 移动寻找。超时返回 False。
     """
@@ -104,6 +270,8 @@ def align_to_class(
     WANDER_MS = 600
     # 偏移多少像素对应 max_step_ms（满偏参考值）
     FULL_OFFSET = 500.0
+
+    target_x = screen_center_x + offset_px
 
     deadline = time.monotonic() + timeout_ms / 1000.0
     consecutive_aligned = 0
@@ -130,14 +298,14 @@ def align_to_class(
             ah.key_up(key)
             continue
 
-        cx = min(centers, key=lambda x: abs(x - screen_center_x))
-        offset = cx - screen_center_x
-        logger.debug(f"{class_name} 中心 x={cx:.0f}，偏移={offset:.0f}")
+        cx = min(centers, key=lambda x: abs(x - target_x))
+        offset = cx - target_x
+        logger.debug(f"{class_name} 中心 x={cx:.0f}，目标={target_x}，偏移={offset:.0f}")
 
         if abs(offset) <= threshold:
             consecutive_aligned += 1
             if consecutive_aligned >= 2:
-                logger.info(f"{class_name} 已对齐（偏移 {offset:.0f}px）")
+                logger.info(f"{class_name} 已对齐（偏移 {offset:.0f}px，目标 {target_x}）")
                 return True
             ah.delay(150, check_reward=False)  # 等角色停稳再确认
             continue
@@ -492,7 +660,11 @@ class PinkPawHeistScheme4Action(CustomAction):
     ) -> CustomAction.RunResult:
         global _run_start_time
         _run_start_time = time.monotonic()
+        SessionRecorder.start()
         ah = ActionHelper(context)
+        # time_debugger = TimeDebugger(interval_s=5.0, label="全局")
+        # time_debugger.start()
+        # loot_debugger = TimeDebugger(interval_s=10.0, label="藏品层")
         try:
             current_ctrl = ah.ctx.tasker.controller
             for _ in range(3):
@@ -502,14 +674,14 @@ class PinkPawHeistScheme4Action(CustomAction):
             get_yolo_model()  # 测试模型
                 
             ah.key_down("W")
-            ah.delay(5000)
+            ah.delay(5500)
             ah.key_down("D")
             ah.delay(3400)
             ah.key_up("D")
             ah.key_up("W")
             align_to_class(ah, "door")
             ah.key_down("W")
-            ah.delay(2000)
+            ah.delay(1500)
             ah.key_up("W")
             ah.click_key("F")
             ah.delay(4000)
@@ -566,10 +738,6 @@ class PinkPawHeistScheme4Action(CustomAction):
             # 穿过铁门区域
             ah.delay(3000)
             ah.key_down("W")
-            ah.delay(2300)
-            ah.key_down("A")
-            ah.delay(2000)
-            ah.key_up("A")
             ah.delay(1500)
             ah.key_up("W")
             ah.delay(300)
@@ -670,6 +838,7 @@ class PinkPawHeistScheme4Action(CustomAction):
 
             ah.click_key("F")
             ah.delay(3000, check_reward=False)
+            
             ah.key_down("W")
             ah.delay(14000)
             ah.key_up("W")
@@ -809,6 +978,10 @@ class PinkPawHeistScheme4Action(CustomAction):
             ah.delay(3000, check_reward=False)
 
             # ---------- 移动至藏品层 ----------
+            # loot_debugger.start_time = time.monotonic()
+            # loot_debugger.start()
+            reset_timer("藏品层")
+
             ah.key_down("W")
             ah.delay(7000)
             ah.key_up("W")
@@ -818,14 +991,19 @@ class PinkPawHeistScheme4Action(CustomAction):
             ah.key_up("A")
             ah.delay(100)
             
-            ah.key_down("S")
+            ah.key_down("W")
             ah.delay(1500)
-            ah.key_up("S")
+            ah.key_up("W")
             ah.delay(100)
             
             ah.key_down("A")
             ah.delay(4420)
             ah.key_up("A")
+            ah.delay(100)
+            
+            ah.key_down("S")
+            ah.delay(1300)
+            ah.key_up("S")
             ah.delay(100)
             
             # 偷左边展柜藏品
@@ -874,6 +1052,8 @@ class PinkPawHeistScheme4Action(CustomAction):
             ah.delay(1000)
             ah.key_up("S")
             ah.delay(100)
+            
+            wait_until(34, cycle_s=18, timer="藏品层")
 
             # 偷左前边展柜藏品
             ah.key_down("D")
@@ -941,6 +1121,8 @@ class PinkPawHeistScheme4Action(CustomAction):
             ah.delay(500)
             ah.key_up("S")
             ah.delay(100)
+            
+            wait_until(1, cycle_s=3.3, timer="藏品层")
 
             ah.key_down("D")
             ah.delay(900)
@@ -962,8 +1144,8 @@ class PinkPawHeistScheme4Action(CustomAction):
             ah.delay(1400)
             ah.key_up("D")
             ah.delay(100)
-            
-            align_to_class(ah, "display table")
+
+            align_to_class(ah, "display table", offset_px=50)
 
             ah.key_down("W")
             ah.delay(500)
@@ -974,7 +1156,8 @@ class PinkPawHeistScheme4Action(CustomAction):
             ah.key_down("S")
             ah.delay(500)
             ah.key_up("S")
-            ah.delay(1700)
+            
+            wait_until(22, cycle_s=3.3, timer="藏品层")
 
             # 穿过第二道竖激光和第三道和第四道激光
             ah.key_down("D")
@@ -1062,7 +1245,7 @@ class PinkPawHeistScheme4Action(CustomAction):
             ah.key_down("S")
             ah.delay(800)
             ah.key_up("S")
-            wait_until(400, cycle_s=18)
+            wait_until(0, cycle_s=18, timer="藏品层")
 
             ah.key_down("A")
             ah.delay(7500)
@@ -1255,7 +1438,7 @@ class PinkPawHeistScheme4Action(CustomAction):
             evac_result = ah.run_task("PinkPawHeist_EvacuateOnce")
             if evac_result.status.succeeded:
                 ah.delay(REWARD_OCR_DELAY_MS, check_reward=False)
-                notify_pinkpaw_reward(ah.ctx, success=True)
+                record_and_notify(ah, True)
                 ah.delay(POST_REWARD_DELAY_MS, check_reward=False)
             else:
                 # ---------- 最后撤离2 ----------
@@ -1303,7 +1486,7 @@ class PinkPawHeistScheme4Action(CustomAction):
                 evac_result = ah.run_task("PinkPawHeist_EvacuateOnce")
                 if evac_result.status.succeeded:
                     ah.delay(REWARD_OCR_DELAY_MS, check_reward=False)
-                    notify_pinkpaw_reward(ah.ctx, success=True)
+                    record_and_notify(ah, True)
                     ah.delay(POST_REWARD_DELAY_MS, check_reward=False)
                 else:
                     # ---------- 最后撤离3 ----------
@@ -1352,10 +1535,10 @@ class PinkPawHeistScheme4Action(CustomAction):
                     evac_result = ah.run_task("PinkPawHeist_EvacuateOnce")
                     if evac_result.status.succeeded:
                         ah.delay(REWARD_OCR_DELAY_MS, check_reward=False)
-                        notify_pinkpaw_reward(ah.ctx, success=True)
+                        record_and_notify(ah, True)
                         ah.delay(POST_REWARD_DELAY_MS, check_reward=False)
                     else:
-                        notify_pinkpaw_reward(ah.ctx, success=False)
+                        record_and_notify(ah, False)
                         self._exit_to_main(ah)
                         return CustomAction.RunResult(success=True)
                     return CustomAction.RunResult(success=True)
@@ -1363,6 +1546,7 @@ class PinkPawHeistScheme4Action(CustomAction):
             return CustomAction.RunResult(success=True)
         except TaskerStoppedException as e:
             print(f"[PinkPawHeist] stopped by tasker: {e}")
+            SessionRecorder.finish("aborted")
             ah.release_controls()
             return CustomAction.RunResult(success=False)
         except StopActionException as e:
@@ -1387,9 +1571,13 @@ class PinkPawHeistScheme4Action(CustomAction):
                 ah.delay(2000, check_reward=False)
             evac_result = ah.run_task("PinkPawHeist_Once")
             ah.delay(10000, check_reward=False)
-            notify_pinkpaw_reward(ah.ctx, success=False)
+            record_and_notify(ah, False)
 
             return CustomAction.RunResult(success=True)
+        finally:
+            # time_debugger.stop()
+            # loot_debugger.stop()
+            pass
 
     def _exit_to_main(self, ah: ActionHelper):
         for _ in range(3):
@@ -1402,21 +1590,29 @@ class PinkPawHeistScheme4Action(CustomAction):
         ah.delay(10000, check_reward=False)
 
 
-def wait_until(target_s: float, cycle_s: float = 0) -> None:
-    """阻塞到距本局开始 target_s 秒后再返回。
+def wait_until(target_s: float, cycle_s: float = 0, timer: str = "default") -> None:
+    """阻塞到距指定计时器起点 target_s 秒后再返回。
+    timer 指定参照哪个命名计时器（默认 "default"，即本局开始时间，
+    可被 reset_timer() 在流程中重置）。
     若已超过 target_s 且指定了 cycle_s，则等到 target_s + N*cycle_s（N 为最小正整数使结果 > 当前时间）。
-    未指定 cycle_s 或无 _run_start_time 则立即返回。
+    未指定 cycle_s 或计时器不存在则立即返回。
     """
-    if _run_start_time is None:
+    origin = _timer_origin(timer)
+    if origin is None:
         return
-    elapsed = time.monotonic() - _run_start_time
+    elapsed = time.monotonic() - origin
     if elapsed < target_s:
         actual = target_s
     elif cycle_s > 0:
         n = math.ceil((elapsed - target_s) / cycle_s)
         actual = target_s + n * cycle_s
     else:
+        logger.info(f"wait_until[{timer}]: 到达时已 T+{elapsed:.1f}s（目标 {target_s}s），立即出发")
+        SessionRecorder.record_wait(timer, target_s, cycle_s, target_s, elapsed)
         return
-    remaining = (_run_start_time + actual) - time.monotonic()
+    remaining = (origin + actual) - time.monotonic()
     if remaining > 0:
         time.sleep(remaining)
+    fire_elapsed = time.monotonic() - origin
+    logger.info(f"wait_until[{timer}]: T+{fire_elapsed:.1f}s 出发（目标 {actual:.1f}s）")
+    SessionRecorder.record_wait(timer, target_s, cycle_s, actual, fire_elapsed)
