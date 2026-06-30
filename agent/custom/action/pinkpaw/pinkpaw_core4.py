@@ -109,19 +109,24 @@ class SessionRecorder:
 
     @classmethod
     def record_wait(cls, timer: str, target_s: float, cycle_s: float,
-                    actual_s: float, fire_elapsed: float) -> None:
+                    actual_s: float, fire_elapsed: float,
+                    mode: str = "point", hi_s: "float | None" = None) -> None:
         if cls._current is None:
             return
         from datetime import datetime
 
-        cls._current["waits"].append({
+        rec = {
             "timer": timer,
+            "mode": mode,
             "target_s": round(target_s, 2),
             "cycle_s": round(cycle_s, 2),
             "actual_s": round(actual_s, 2),
             "fire_elapsed": round(fire_elapsed, 2),
             "fire_wall": datetime.now().isoformat(timespec="milliseconds"),
-        })
+        }
+        if hi_s is not None:
+            rec["hi_s"] = round(hi_s, 2)  # window 模式：探测区间上界（target_s 即下界 lo_s）
+        cls._current["waits"].append(rec)
 
     @classmethod
     def finish(cls, result) -> None:
@@ -1122,7 +1127,7 @@ class PinkPawHeistScheme4Action(CustomAction):
             ah.key_up("S")
             ah.delay(100)
             
-            wait_until(1, cycle_s=3.3, timer="藏品层")
+            wait_window(83.0, 85.0, cycle_s=3.3, timer="藏品层")
 
             ah.key_down("D")
             ah.delay(900)
@@ -1157,7 +1162,7 @@ class PinkPawHeistScheme4Action(CustomAction):
             ah.delay(500)
             ah.key_up("S")
             
-            wait_until(22, cycle_s=3.3, timer="藏品层")
+            wait_window(97.0, 99.0, cycle_s=3.3, timer="藏品层")
 
             # 穿过第二道竖激光和第三道和第四道激光
             ah.key_down("D")
@@ -1616,3 +1621,39 @@ def wait_until(target_s: float, cycle_s: float = 0, timer: str = "default") -> N
     fire_elapsed = time.monotonic() - origin
     logger.info(f"wait_until[{timer}]: T+{fire_elapsed:.1f}s 出发（目标 {actual:.1f}s）")
     SessionRecorder.record_wait(timer, target_s, cycle_s, actual, fire_elapsed)
+
+
+def wait_window(lo_s: float, hi_s: float, cycle_s: float, timer: str = "default") -> None:
+    """数据探测模式：在探测区间 [lo_s, hi_s] 内随机选一点触发，该区间按 cycle_s 周期重复。
+
+    与 wait_until 的固定点不同，本函数让每局的 fire_elapsed 在区间内均匀铺开，
+    从而在大数据里把绿灯窗的连续边界显出来（探测区间应略宽于猜测的安全窗，
+    故意覆盖一点危险区，才能采到边界两侧的成功/失败样本）。
+
+    选取“整段都在当前时刻之后”的最近一个区间，保证每局在 [lo_s, hi_s] 上无偏采样
+    （代价是偶尔多等一个周期）。计时器不存在则立即返回。
+    """
+    import random
+
+    origin = _timer_origin(timer)
+    if origin is None:
+        return
+    elapsed = time.monotonic() - origin
+    if elapsed <= lo_s:
+        n = 0
+    else:
+        n = math.ceil((elapsed - lo_s) / cycle_s)
+    band_lo = lo_s + n * cycle_s
+    band_hi = hi_s + n * cycle_s
+    target = random.uniform(band_lo, band_hi)
+    remaining = (origin + target) - time.monotonic()
+    if remaining > 0:
+        time.sleep(remaining)
+    fire_elapsed = time.monotonic() - origin
+    logger.info(
+        f"wait_window[{timer}]: T+{fire_elapsed:.2f}s 出发"
+        f"（探测窗 [{band_lo:.1f}, {band_hi:.1f}]，第 {n} 周期）"
+    )
+    SessionRecorder.record_wait(
+        timer, lo_s, cycle_s, target, fire_elapsed, mode="window", hi_s=hi_s
+    )
