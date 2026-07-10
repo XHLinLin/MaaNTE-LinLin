@@ -261,13 +261,20 @@ def align_to_class(
     max_step_ms: int = 400,
     timeout_ms: int = 8000,
     offset_px: int = 0,
+    target_side: str = "center",  # 新增参数: "left", "center", "right"
 ) -> bool:
     """
     横向移动直到指定类的中心落在目标点 threshold 像素范围内。
     offset_px 为偏移补偿：目标点 = screen_center_x + offset_px
     （负值让目标最终停在屏幕中心偏左，正值偏右）。
     步长按偏移量比例缩放（偏得近走得少），防止过冲。
-    未检测到时随机 A/D 移动寻找。超时返回 False。
+    未检测到时根据 target_side 智能选择移动方向。
+    
+    target_side: 目标在屏幕的位置偏好
+    - "center": 搜索全部区域（原有模式）
+    - "left": 只搜索左侧3/4区域（忽略右侧1/4），未找到时向左搜索
+    - "right": 只搜索右侧3/4区域（忽略左侧1/4），未找到时向右搜索
+    超时返回 False。
     """
     import time
     import random
@@ -277,6 +284,26 @@ def align_to_class(
     FULL_OFFSET = 500.0
 
     target_x = screen_center_x + offset_px
+    
+    # 根据 target_side 设置搜索区域边界（3/4屏幕范围）
+    screen_width = screen_center_x * 2  # 假设屏幕宽 1280
+    if target_side == "left":
+        # 左侧3/4：从最左到屏幕中心偏右一点（左3/4）
+        search_min = 0
+        search_max = screen_center_x + screen_width // 4  # 640 + 320 = 960
+        default_search_key = key_left
+        logger.debug(f"左侧搜索模式：范围 0 ~ {search_max}")
+    elif target_side == "right":
+        # 右侧3/4：从屏幕中心偏左一点到最右（右3/4）
+        search_min = screen_center_x - screen_width // 4  # 640 - 320 = 320
+        search_max = screen_width
+        default_search_key = key_right
+        logger.debug(f"右侧搜索模式：范围 {search_min} ~ {screen_width}")
+    else:  # "center" 或默认
+        search_min = 0
+        search_max = screen_width
+        default_search_key = None
+        logger.debug("全屏搜索模式")
 
     deadline = time.monotonic() + timeout_ms / 1000.0
     consecutive_aligned = 0
@@ -292,17 +319,33 @@ def align_to_class(
             for box, cls in zip(results[0].boxes.xyxy, results[0].boxes.cls):
                 if yolo_model.names[int(cls)] == class_name:
                     x1, _, x2, _ = box.tolist()
-                    centers.append((x1 + x2) / 2)
+                    cx = (x1 + x2) / 2
+                    
+                    # 根据 target_side 过滤检测结果（只保留在搜索区域内的）
+                    if search_min <= cx <= search_max:
+                        centers.append(cx)
+                    else:
+                        logger.debug(f"忽略在搜索区域外的目标：cx={cx:.0f}")
 
         if not centers:
-            logger.debug(f"{class_name} 未检测到，随机移动寻找")
+            logger.debug(f"{class_name} 未在搜索区域内检测到")
             consecutive_aligned = 0
-            key = key_right if random.random() > 0.5 else key_left
+            
+            # 根据 target_side 选择移动方向
+            if default_search_key:
+                key = default_search_key
+                logger.debug(f"按 {key} 在目标区域方向搜索")
+            else:
+                # 原有随机模式
+                key = key_right if random.random() > 0.5 else key_left
+                logger.debug(f"随机移动：按 {key}")
+                
             ah.key_down(key)
             ah.delay(WANDER_MS, check_reward=False)
             ah.key_up(key)
             continue
 
+        # 选择最接近目标点的检测结果
         cx = min(centers, key=lambda x: abs(x - target_x))
         offset = cx - target_x
         logger.debug(f"{class_name} 中心 x={cx:.0f}，目标={target_x}，偏移={offset:.0f}")
@@ -310,7 +353,7 @@ def align_to_class(
         if abs(offset) <= threshold:
             consecutive_aligned += 1
             if consecutive_aligned >= 2:
-                logger.info(f"{class_name} 已对齐（偏移 {offset:.0f}px，目标 {target_x}）")
+                logger.info(f"{class_name} 已对齐（偏移 {offset:.0f}px，目标 {target_x}，模式 {target_side}）")
                 return True
             ah.delay(150, check_reward=False)  # 等角色停稳再确认
             continue
@@ -322,7 +365,7 @@ def align_to_class(
         ah.delay(step_ms, check_reward=False)
         ah.key_up(key)
 
-    logger.warning(f"align_to_class({class_name}) 超时（{timeout_ms}ms）")
+    logger.warning(f"align_to_class({class_name}) 超时（{timeout_ms}ms），模式 {target_side}")
     return False
 
 
@@ -380,7 +423,6 @@ def walk_until_class_exit(
 
     ah.key_up(key)
     ah.delay(1000)
-
 
 class ActionHelper:
     def __init__(self, ctx: Context):
@@ -684,7 +726,7 @@ class PinkPawHeistScheme4Action(CustomAction):
             ah.delay(3400)
             ah.key_up("D")
             ah.key_up("W")
-            align_to_class(ah, "door")
+            align_to_class(ah, "door", target_side="right")
             ah.key_down("W")
             ah.delay(1500)
             ah.key_up("W")
@@ -701,47 +743,52 @@ class PinkPawHeistScheme4Action(CustomAction):
                 ah.delay(200)
             ah.key_up("W")
             ah.delay(100)
-            ah.key_down("S")
-            ah.delay(700)
-            ah.key_up("S")
+            # ah.key_down("S")
+            # ah.delay(700)
+            # ah.key_up("S")
 
             # ----- 第一场战斗（怪堆） -----
-            ah.run_task("PinkPawHeist_Core1_Log_FightG1")
-            for _ in range(3):
-                ah.click_key("1")
-                ah.delay(200)
-            ah.click_key("E")
-            ah.delay(200)
-            ah.click_key("E")
-            ah.delay(200)
-            ah.click_key("E")
+            # ah.run_task("PinkPawHeist_Core1_Log_FightG1")
+            # for _ in range(3):
+            #     ah.click_key("1")
+            #     ah.delay(200)
+            # ah.click_key("E")
+            # ah.delay(200)
+            # ah.click_key("E")
+            # ah.delay(200)
+            # ah.click_key("E")
 
-            if not ah.fight_until_no_monster(
-                timeout_no_monster=10000,
-                wait_for_monster=True,
-                role_to_switch_back="3",
-                loot=False,
-                attack_cycles=3,
-            ):
-                self._exit_to_main(ah)
-                return CustomAction.RunResult(success=True)
+            # if not ah.fight_until_no_monster(
+            #     timeout_no_monster=10000,
+            #     wait_for_monster=True,
+            #     role_to_switch_back="3",
+            #     loot=False,
+            #     attack_cycles=3,
+            # ):
+            #     self._exit_to_main(ah)
+            #     return CustomAction.RunResult(success=True)
 
             # 打开铁门
-            align_to_class(ah, "door")
-            ah.key_down("W")
-            ah.delay(2000)
-            ah.key_up("W")
-            ah.delay(200)
+            # ah.click_key("3")
+            # ah.delay(300)
+            
+            # ah.key_down("W")
+            # ah.delay(2000)
+            # ah.key_up("W")
+            # ah.delay(200)
 
             ah.click_key("F")
             ah.delay(300)
             ah.click_key("F")
             ah.delay(300)
             ah.click_key("F")
-            ah.delay(1000)
+            ah.delay(4000)
 
             # 穿过铁门区域
-            ah.delay(3000)
+            # align_to_class(ah, "door")
+            ah.key_down("A")
+            ah.delay(150)
+            ah.key_up("A")
             ah.key_down("W")
             ah.delay(1500)
             ah.key_up("W")
@@ -980,13 +1027,13 @@ class PinkPawHeistScheme4Action(CustomAction):
             ah.key_up("W")
             ah.delay(200)
             ah.click_key("F")
-            ah.delay(3000, check_reward=False)
+            ah.delay(2500, check_reward=False)
 
             # ---------- 移动至藏品层 ----------
             # loot_debugger.start_time = time.monotonic()
             # loot_debugger.start()
             reset_timer("藏品层")
-
+           
             ah.key_down("W")
             ah.delay(7000)
             ah.key_up("W")
@@ -1114,7 +1161,7 @@ class PinkPawHeistScheme4Action(CustomAction):
             ah.key_up("D")
             ah.delay(100)
             
-            align_to_class(ah, "display table")
+            align_to_class(ah, "display table", target_side="right")
 
             ah.key_down("W")
             ah.delay(500)
@@ -1127,7 +1174,7 @@ class PinkPawHeistScheme4Action(CustomAction):
             ah.key_up("S")
             ah.delay(100)
             
-            wait_window(83.0, 85.0, cycle_s=3.3, timer="藏品层")
+            wait_window(83.5, 84.0, cycle_s=3.3, timer="藏品层")
 
             ah.key_down("D")
             ah.delay(900)
@@ -1150,7 +1197,7 @@ class PinkPawHeistScheme4Action(CustomAction):
             ah.key_up("D")
             ah.delay(100)
 
-            align_to_class(ah, "display table", offset_px=50)
+            align_to_class(ah, "display table", offset_px=50, target_side="right")
 
             ah.key_down("W")
             ah.delay(500)
@@ -1162,7 +1209,7 @@ class PinkPawHeistScheme4Action(CustomAction):
             ah.delay(500)
             ah.key_up("S")
             
-            wait_window(97.0, 99.0, cycle_s=3.3, timer="藏品层")
+            wait_window(98, 98.5, cycle_s=3.3, timer="藏品层")
 
             # 穿过第二道竖激光和第三道和第四道激光
             ah.key_down("D")
@@ -1170,7 +1217,7 @@ class PinkPawHeistScheme4Action(CustomAction):
             ah.key_up("D")
             ah.delay(100)
             
-            align_to_class(ah, "display table")
+            align_to_class(ah, "display table",target_side = "right")
 
             ah.key_down("W")
             ah.delay(500)
@@ -1250,7 +1297,7 @@ class PinkPawHeistScheme4Action(CustomAction):
             ah.key_down("S")
             ah.delay(800)
             ah.key_up("S")
-            wait_until(0, cycle_s=18, timer="藏品层")
+            wait_window(145, 150, cycle_s=18, timer="藏品层")
 
             ah.key_down("A")
             ah.delay(7500)
